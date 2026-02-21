@@ -41,6 +41,8 @@ class CoachingEngine:
         self.complex_map: dict[int, Complex] = {}  # ADDED
         self.corners: list[Corner] = []
         self.sectors: list[Sector] = []
+        self.reference_line = None  # placeholder for future geometry coaching
+
 
         # Live state
         self.live_speed = 0.0
