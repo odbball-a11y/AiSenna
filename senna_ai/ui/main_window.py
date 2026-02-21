@@ -591,7 +591,7 @@ class SennaCoachApp:
             self._cards["target"].config(text="—")
 
         # ── Track Map Drawing ──
-        if self.track_map_canvas and eng.reference_line:
+        if self.track_map_canvas and hasattr(eng, "reference_line") and eng.reference_line:
             # Initialize bounds if needed
             if not self.track_map_initialized and eng.reference_line:
                 # Calculate bounds from reference line
@@ -614,7 +614,7 @@ class SennaCoachApp:
             self.track_map_canvas.delete("all")
             
             # Draw reference line (grey)
-            if eng.reference_line and self.track_map_bounds:
+            if hasattr(eng, "reference_line") and eng.reference_line and self.track_map_bounds: 
                 min_x, max_x, min_y, max_y = self.track_map_bounds
                 points = []
                 for x, y in eng.reference_line:
