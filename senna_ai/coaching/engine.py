@@ -416,6 +416,14 @@ class CoachingEngine:
             return None
         return LapTrace(points=data)
 
+    def _find_apex_dist(self, trace: LapTrace, corner: Corner) -> Optional[float]:
+        """Return dist_m where minimum speed occurs within the corner zone."""
+        pts = [p for p in trace.points
+               if corner.brake_point_m <= p.dist_m <= corner.exit_m and p.speed_kph > 0]
+        if not pts:
+            return None
+        return min(pts, key=lambda p: p.speed_kph).dist_m
+
     # ── Sector timing ──
 
     def _check_sector_crossing(self, point: TelPoint):
@@ -783,6 +791,36 @@ class CoachingEngine:
                     self._corner_advice_type[corner.index] = 'brake_early'
                     return msg
 
+        # ── Apex timing: driver's min-speed point is before the reference apex ──
+        apex_dist = self._find_apex_dist(driver_trace, corner)
+        if apex_dist is not None and apex_dist < corner.apex_m - 25:
+            delta = corner.apex_m - apex_dist  # metres too early
+            self._record_corner_event(corner.index, delta, self.live_dist, 'apex_early')
+            msg = self.enhanced_coach.generate_pre(
+                corner.index, 'apex_early', delta=delta,
+                complex_name=complex_name, corners=complex_corners
+            )
+            if msg:
+                self._corner_advice_type[corner.index] = 'apex_early'
+                return msg
+
+        # ── Line: lateral deviation from reference at apex (needs position data) ──
+        if ref_trace and ref_trace._spline_dists and driver_trace.has_position_data():
+            drv_apex_pt = driver_trace.get_at_dist(corner.apex_m, window=30)
+            if drv_apex_pt and (abs(drv_apex_pt.world_x) > 0.1 or abs(drv_apex_pt.world_z) > 0.1):
+                dev = ref_trace.get_lateral_deviation(
+                    corner.apex_m, drv_apex_pt.world_x, drv_apex_pt.world_z
+                )
+                if dev is not None and abs(dev) > 1.5:
+                    self._record_corner_event(corner.index, abs(dev), self.live_dist, 'line_wide')
+                    msg = self.enhanced_coach.generate_pre(
+                        corner.index, 'line_wide', delta=abs(dev),
+                        complex_name=complex_name, corners=complex_corners
+                    )
+                    if msg:
+                        self._corner_advice_type[corner.index] = 'line_wide'
+                        return msg
+
         if driver_apex and ct:
             delta = ref_apex_speed - driver_apex.speed_kph
             if delta > 8:
@@ -938,6 +976,54 @@ class CoachingEngine:
                         if msg:
                             return msg
 
+            elif advice_type == 'apex_early':
+                cur_apex_dist = self._find_apex_dist(driver_trace, corner)
+                prev_apex_dist = self._find_apex_dist(prev_trace, corner)
+                if cur_apex_dist is not None and prev_apex_dist is not None:
+                    delta = cur_apex_dist - prev_apex_dist  # positive = later this lap = improved
+                    if delta > 10:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'improved_apex_early', delta=delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+                    else:
+                        remaining = corner.apex_m - cur_apex_dist
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'apex_early', delta=max(0, remaining),
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+
+            elif advice_type == 'line_wide' and ct and ct.target_trace:
+                ref_trace_ct = ct.target_trace
+                if ref_trace_ct._spline_dists and driver_trace.has_position_data():
+                    drv_pt = driver_trace.get_at_dist(corner.apex_m, window=30)
+                    if drv_pt and (abs(drv_pt.world_x) > 0.1 or abs(drv_pt.world_z) > 0.1):
+                        cur_dev = ref_trace_ct.get_lateral_deviation(
+                            corner.apex_m, drv_pt.world_x, drv_pt.world_z)
+                        prev_data_pts = self._prev_corner_data.get(corner.index, [])
+                        prev_t = LapTrace(points=prev_data_pts) if len(prev_data_pts) >= 5 else None
+                        prev_dev = None
+                        if prev_t and prev_t.has_position_data():
+                            prev_pt = prev_t.get_at_dist(corner.apex_m, window=30)
+                            if prev_pt and (abs(prev_pt.world_x) > 0.1 or abs(prev_pt.world_z) > 0.1):
+                                prev_dev = ref_trace_ct.get_lateral_deviation(
+                                    corner.apex_m, prev_pt.world_x, prev_pt.world_z)
+                        if cur_dev is not None:
+                            if prev_dev is not None and (abs(prev_dev) - abs(cur_dev)) > 0.4:
+                                msg = self.enhanced_coach.generate_post(
+                                    corner.index, 'improved_line', delta=abs(prev_dev) - abs(cur_dev),
+                                    complex_name=complex_name, corners=complex_corners)
+                                if msg:
+                                    return msg
+                            else:
+                                msg = self.enhanced_coach.generate_post(
+                                    corner.index, 'line_wide', delta=abs(cur_dev),
+                                    complex_name=complex_name, corners=complex_corners)
+                                if msg:
+                                    return msg
+
             else:
                 # No specific advice type — compare apex as general indicator
                 if driver_apex:
@@ -998,6 +1084,30 @@ class CoachingEngine:
                     self._record_corner_event(corner.index, 100, self.live_dist, 'no_trail_brake')
                     msg = self.enhanced_coach.generate_post(
                         corner.index, 'no_trail_brake',
+                        complex_name=complex_name, corners=complex_corners)
+                    if msg:
+                        return msg
+
+        # ── Fallback apex_early / line_wide vs reference (no prev lap) ──
+        apex_dist = self._find_apex_dist(driver_trace, corner)
+        if apex_dist is not None and apex_dist < corner.apex_m - 25:
+            delta = corner.apex_m - apex_dist
+            self._record_corner_event(corner.index, delta, self.live_dist, 'apex_early')
+            msg = self.enhanced_coach.generate_post(
+                corner.index, 'apex_early', delta=delta,
+                complex_name=complex_name, corners=complex_corners)
+            if msg:
+                return msg
+
+        if ct and ct.target_trace and ct.target_trace._spline_dists and driver_trace.has_position_data():
+            drv_pt = driver_trace.get_at_dist(corner.apex_m, window=30)
+            if drv_pt and (abs(drv_pt.world_x) > 0.1 or abs(drv_pt.world_z) > 0.1):
+                dev = ct.target_trace.get_lateral_deviation(
+                    corner.apex_m, drv_pt.world_x, drv_pt.world_z)
+                if dev is not None and abs(dev) > 1.5:
+                    self._record_corner_event(corner.index, abs(dev), self.live_dist, 'line_wide')
+                    msg = self.enhanced_coach.generate_post(
+                        corner.index, 'line_wide', delta=abs(dev),
                         complex_name=complex_name, corners=complex_corners)
                     if msg:
                         return msg
@@ -1424,6 +1534,48 @@ class EnhancedCoachingGenerator:
                 "C{idx}: better exit speed. Keep hitting that apex.",
                 "{idx}: exit up {delta:.0f}kph. Apex is working.",
                 "C{idx}: good exit. That's exactly what we needed."
+            ],
+            'apex_early_pre': [
+                "C{idx}: apex too early, {delta:.0f}m ahead of the sweet spot. Wait for the exit to open.",
+                "Corner {idx}: you're turning in too soon. Hold the outside {delta:.0f}m longer.",
+                "Into {idx}: early apex. Delay turn-in, let the corner come to you.",
+                "C{idx}: turning too early. Hold wider on entry, apex later.",
+                "Corner {idx}: early apex costing exit speed. Wait, then commit."
+            ],
+            'apex_early_post': [
+                "C{idx}: still apexing {delta:.0f}m early. Hold the outside longer next lap.",
+                "Early apex at {idx} again. Delay turn-in, wait for the exit to open.",
+                "{idx}: too early on apex. Drive past the early apex point, then turn.",
+                "C{idx}: turning in before the apex. Hold it wider, later.",
+                "Corner {idx}: early apex. Stay on the outside until the road straightens."
+            ],
+            'improved_apex_early_post': [
+                "C{idx}: apex {delta:.0f}m later. Better. Keep pushing it back.",
+                "Better timing at {idx}. Apex is later, exit will open up.",
+                "C{idx}: later apex this lap. That's the improvement we needed.",
+                "{idx}: held the outside longer. Good. Now nail the exit.",
+                "C{idx}: apex timing improved. Keep that patience on entry."
+            ],
+            'line_wide_pre': [
+                "C{idx}: {delta:.1f}m off the reference at apex. Use more track, clip the inside.",
+                "Corner {idx}: missing the apex. Get tighter, use the full width.",
+                "Into {idx}: you're not using the track. More width on entry, clip the kerb.",
+                "C{idx}: wide at apex. Drive to the edge, use every metre.",
+                "Corner {idx}: off the line. Entry wide, apex tight, exit wide."
+            ],
+            'line_wide_post': [
+                "C{idx}: {delta:.1f}m from the reference line at apex. Use more track.",
+                "Off line at {idx}. Get the front to the kerb at apex.",
+                "{idx}: missing the inside. Use the full track width.",
+                "C{idx}: not clipping the apex. More commitment to the inside.",
+                "Corner {idx}: you're leaving track on the table. Clip the apex."
+            ],
+            'improved_line_post': [
+                "C{idx}: better line. Closer to the reference at apex.",
+                "Line improved at {idx}. Keep committing to the apex.",
+                "C{idx}: tighter apex this lap. That's the right direction.",
+                "{idx}: line is cleaner. Keep using the full track.",
+                "C{idx}: better through apex. That's the line."
             ]
         }
     
