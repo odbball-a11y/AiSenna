@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Corner detection and track data structures
 from senna_ai.telemetry.models import TelPoint, LapTrace
 from senna_ai.coaching.coaching_constants import (
@@ -32,7 +33,7 @@ class Corner:
 
 @dataclass
 class Sector:
-    """A sector = brake point of this corner → brake point of next corner."""
+    """A sector = brake point of this corner -> brake point of next corner."""
     index: int
     corner: Corner
     start_m: float
@@ -311,7 +312,7 @@ def detect_corners(points: list[TelPoint]) -> list[Corner]:
             approach_m=brake_point_m - APPROACH_WARN_M,
         ))
         log.info(
-            "  C%d: brake@%.0fm → apex@%.0fm (%.0fkph G%d) → exit@%.0fm",
+            "  C%d: brake@%.0fm -> apex@%.0fm (%.0fkph G%d) -> exit@%.0fm",
             i + 1, brake_point_m, z["min_speed_dist"], z["min_speed"],
             z["gear_at_min"], z["end_m"],
         )
@@ -320,7 +321,7 @@ def detect_corners(points: list[TelPoint]) -> list[Corner]:
 
 
 def build_sectors(corners: list[Corner], track_length: float = 0) -> list[Sector]:
-    """Build sectors from corners: each sector = brake point → next brake point."""
+    """Build sectors from corners: each sector = brake point -> next brake point."""
     if not corners:
         return []
 
@@ -354,7 +355,7 @@ def build_sectors(corners: list[Corner], track_length: float = 0) -> list[Sector
                 ))
 
     for s in sectors:
-        log.info("  S%d: %.0fm → %.0fm (%.0fm)%s",
+        log.info("  S%d: %.0fm -> %.0fm (%.0fm)%s",
                  s.index, s.start_m, s.end_m, s.length_m,
                  " [wraps]" if s.wraps else "")
 
@@ -466,7 +467,7 @@ def build_consensus_corners(
     )
     for c in consensus_corners:
         log.info(
-            "  C%d: brake@%.0fm → apex@%.0fm (%.0fkph G%d) → exit@%.0fm",
+            "  C%d: brake@%.0fm -> apex@%.0fm (%.0fkph G%d) -> exit@%.0fm",
             c.index, c.brake_point_m, c.apex_m,
             c.apex_speed_kph, c.apex_gear, c.exit_m,
         )

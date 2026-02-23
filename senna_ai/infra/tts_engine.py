@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 
 import os
 import time
@@ -45,10 +46,14 @@ class Speaker:
         self._volume = max(0, min(200, val))
 
     def say(self, text: str):
+        # 5️⃣ Inside Speaker.speak()
+        log.info("🔊 SPEAKER INVOKED: %s", text)
         with self._lock:
             self._queue.append(text)
 
     def say_priority(self, text: str):
+        # 5️⃣ Inside Speaker.speak()
+        log.info("🔊 SPEAKER INVOKED: %s", text)
         with self._lock:
             self._queue.appendleft(text)
 

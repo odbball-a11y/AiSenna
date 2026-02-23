@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from senna_ai.track.corner_detection import Corner, Sector, SectorResult, CornerTarget, build_sectors
 from senna_ai.track.composite_builder import CompositeLap

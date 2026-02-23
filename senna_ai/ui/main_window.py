@@ -1,8 +1,44 @@
+# -*- coding: utf-8 -*-
 import os
 import tkinter as tk
 from tkinter import ttk, filedialog
 import logging
-import logging
+import logging.handlers
+
+# Setup logs directory
+logs_dir = os.path.join(os.getcwd(), "logs")
+os.makedirs(logs_dir, exist_ok=True)
+
+log_file = os.path.join(logs_dir, "senna_coach.log")
+
+# Create a custom formatter
+formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Console handler with UTF-8 encoding
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+
+# File handler with daily rotation, keep 30 days of logs, UTF-8 encoding
+file_handler = logging.handlers.TimedRotatingFileHandler(
+    log_file, when='midnight', interval=1, backupCount=30,
+    encoding='utf-8'
+)
+file_handler.setFormatter(formatter)
+
+# Get the root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
+logging.info("Logging configured, logs saved to %s", log_file)
+
+# Also capture warnings
+logging.captureWarnings(True)
+
 
 from senna_ai.infra.tts_engine import Speaker, TTS_RATE
 from senna_ai.coaching.engine import CoachingEngine
@@ -12,13 +48,6 @@ from senna_ai.telemetry.models import RefLapFile
 from senna_ai.track.composite_builder import CompositeLap
 from senna_ai.coaching.coaching_constants import TIER_PROMOTION_LAPS
 log = logging.getLogger(__name__)
-
-
-import logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 
 
 import argparse
@@ -331,7 +360,7 @@ class SennaCoachApp:
         Priority order for building composite:
           1. Same track + same car class (best: like-for-like comparison)
           2. Same track + any class (fallback: corners still valid, speeds differ)
-          3. No laps at all → voice says "no reference data", starts capturing
+          3. No laps at all -> voice says "no reference data", starts capturing
 
         Within each group, all laps are used for the composite (more = better tiers).
         """

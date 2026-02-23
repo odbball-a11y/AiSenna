@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -165,7 +166,7 @@ class OpponentTracker:
 
                     # ── Detect lap crossing (distance wraps from near end to near start) ──
                     # Must be a genuine full-lap wrap, not a pit stop or reset.
-                    # The drop must be >80% of track length (e.g. 4800→100 on a 4900m track)
+                    # The drop must be >80% of track length (e.g. 4800->100 on a 4900m track)
                     # and the car must have been in the last 20% of the track.
                     dist_drop = opp.last_dist - dist
                     crossed = (
@@ -285,7 +286,7 @@ class OpponentTracker:
 
             self._fastest_saved = min(self._fastest_saved, lap_time)
             log.info(
-                "💾 Saved opponent lap: %s (%.3fs, %d pts) → %s",
+                "💾 Saved opponent lap: %s (%.3fs, %d pts) -> %s",
                 opp.driver_name, lap_time, len(points), fname,
             )
 

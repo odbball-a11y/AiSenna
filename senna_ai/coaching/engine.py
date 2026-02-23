@@ -1,7 +1,13 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from senna_ai.track.corner_detection import Corner, Sector, SectorResult
+import time
+import math
+from typing import List, Optional, Dict, Set, Tuple
+import logging
+
+from senna_ai.track.corner_detection import Corner, Sector, SectorResult, CornerTarget, build_sectors
 from senna_ai.track.composite_builder import CompositeLap
-from senna_ai.track.complex_detection import Complex
+from senna_ai.track.complex_detection import Complex, detect_complexes  
 from senna_ai.track.force_stage_model import ForceStageModel
 from senna_ai.track.track_model import TrackModel
 
@@ -10,11 +16,7 @@ from senna_ai.coaching.coaching_constants import *
 from senna_ai.coaching.coaching_constants import MIN_SPEED_MPS
 from senna_ai.coaching.coaching_constants import BRAKE_THRESHOLD
 from senna_ai.coaching.coaching_constants import TIER_PROMOTION_LAPS
-
-
-
-import logging
-from typing import List, Optional
+from senna_ai.infra.tts_engine import Speaker
 
 log = logging.getLogger(__name__)
 
@@ -81,16 +83,47 @@ class CoachingEngine:
         self.sector_target: dict[int, float] = {}
         self.last_sector_results: list[SectorResult] = []
 
-        # Per-corner issue history for progressive feedback escalation
+                # Per-corner issue history for progressive feedback escalation
         self._issue_history: dict[tuple[int, str], int] = {}
         self._last_feedback: dict[int, str] = {}
         
         # ADDED: Enhanced coaching
         self.enhanced_coach = EnhancedCoachingGenerator()
+        
+        # Strategic Lap Focus Model
+        self.lap_focus_entities: Set[int] = set()  # Set of entity indices (corner or complex)
+        self.last_focus_entities: Set[int] = set()  # Focus entities from previous lap
+        self.entity_time_loss: Dict[int, float] = {}  # Time loss per entity (corner/complex)
+        self.entity_improvement_history: Dict[int, List[float]] = {}  # Track improvement per entity
+        
+        # Speech budget tracking
+        self.speech_budget_max = MAX_FOCUS_ENTITIES * 2  # 6: approach + post per entity
+        self.corner_events_this_lap: List[dict] = []  # list of dicts: corner_idx, delta, dist, issue_type, timestamp
+        self.speeches_this_lap: List[dict] = []  # list of dicts: dist, source, corner_idx, timestamp
+        self.min_speech_spacing_m = MIN_SPACING_M
+        self.entities_spoken_this_lap: Set[int] = set()  # entities coached this lap (diagnostic)
+
+        # Per-lap comparison tracking
+        self._prev_corner_data: dict[int, list[TelPoint]] = {}  # corner data from previous lap
+        self._corner_advice_type: dict[int, str] = {}  # issue type from approach cue given this lap
 
     def set_reference_laps(self, laps: list[RefLapFile]):
         """Set ALL reference laps for the current track. Builds composite."""
         self.ref_laps = laps
+
+        from senna_ai.track.corner_detection import detect_corners
+
+        # Ensure corners exist on reference laps    
+        for lap in laps:
+            if getattr(lap, "trace", None) and getattr(lap.trace, "points", None):
+                if not getattr(lap, "corners", None):
+                    lap.corners = detect_corners(lap.trace.points)
+
+
+
+
+
+
         if not laps:
             return
 
@@ -102,16 +135,32 @@ class CoachingEngine:
             log.warning("No reference laps have detected corners — cannot build composite.")
             return
 
-        max_corners = max(len(l.corners) for l in viable)
-        min_acceptable = max(3, int(max_corners * 0.8))
-        geometry_candidates = [l for l in viable if len(l.corners) >= min_acceptable]
-        if not geometry_candidates:
-            geometry_candidates = viable
-        fastest = min(geometry_candidates, key=lambda l: l.lap_time)
+        from collections import Counter
+        corner_counts = Counter(len(l.corners) for l in viable)
+        modal_count = corner_counts.most_common(1)[0][0]
+        log.info(   
+            "Modal corner count selected: %d (distribution=%s)",
+            modal_count,
+            dict(corner_counts),
+        )
+        
 
-        log.info("Geometry ref: %s (%.3fs, %d corners) — max_corners=%d across %d viable laps",
-                 fastest.car_name[:30], fastest.lap_time, len(fastest.corners),
-                 max_corners, len(viable))
+        geometry_candidates = [
+            l for l in viable if len(l.corners) == modal_count
+        ]
+        fastest = min(geometry_candidates, key=lambda l: l.lap_time)
+        
+        
+        
+
+        log.info(
+            "Geometry ref: %s (%.3fs, %d corners) — modal_count=%d across %d viable laps",
+            fastest.car_name[:30],
+            fastest.lap_time,
+            len(fastest.corners),
+            modal_count,
+            len(viable),
+)
         self.corners = fastest.corners
 
         track_len = fastest.track_length if fastest.track_length > 0 else 0
@@ -164,7 +213,7 @@ class CoachingEngine:
 
     def start(self):
         if not self.corners:
-            self.speaker.say("No corners detected. Check your reference laps.")
+            self._speak("No corners detected. Check your reference laps.", source="start_no_corners")
             return
 
         self.phase = self.PHASE_COACHING
@@ -186,15 +235,15 @@ class CoachingEngine:
         self.sector_pb = {}
         self.last_sector_results = []
 
-        self.speaker.say(
-            f"{len(self.corners)} corners, {len(self.sectors)} sectors. "
-            f"Drive when ready."
+        self._speak(
+            f"{len(self.corners)} corners, {len(self.sectors)} sectors. Drive when ready.",
+            source="start_coaching"
         )
         self._notify()
 
     def stop(self):
         self.phase = self.PHASE_WAITING
-        self.speaker.say("Coach stopped.")
+        self._speak("Coach stopped.", source="stop")
         self._notify()
 
     def feed(self, dist_m: float, speed_kph: float, speed_mps: float,
@@ -222,6 +271,9 @@ class CoachingEngine:
 
         if self.phase != self.PHASE_COACHING or not self.corners:
             return
+
+        # 1️⃣ Add log before coaching evaluation begins
+        log.info("🟡 Coaching check: dist=%.0fm phase=%s", dist_m, self.phase)
 
         point = TelPoint(
             dist_m=dist_m, speed_kph=speed_kph,
@@ -253,6 +305,13 @@ class CoachingEngine:
             self.lap_count += 1
             self._approach_fired.clear()
             self._post_fired.clear()
+            # Save corner data snapshot for post-feedback comparison next lap
+            self._prev_corner_data = {k: list(v) for k, v in self._corner_data.items()}
+            self._corner_advice_type.clear()
+            # Reset speech tracking for new lap
+            self.corner_events_this_lap.clear()
+            self.speeches_this_lap.clear()
+            self.entities_spoken_this_lap.clear()
             ready_count = len(self._corner_ready)
             total_count = len(self.corners)
 
@@ -284,26 +343,30 @@ class CoachingEngine:
                     lap_time_str = f"{lt_sec:.1f} seconds"
 
             if ready_count < total_count:
-                self.speaker.say(
-                    f"Lap {self.lap_count}. "
-                    f"Learning. {ready_count} of {total_count} corners ready."
+                self._speak(
+                    f"Lap {self.lap_count}. Learning. {ready_count} of {total_count} corners ready.",
+                    source="lap_completion_learning"
                 )
             elif self.last_lap_time > 0:
                 if is_pb and self.lap_count > 2:
-                    self.speaker.say(
-                        f"Lap {self.lap_count}. {lap_time_str}. Personal best!"
+                    self._speak(
+                        f"Lap {self.lap_count}. {lap_time_str}. Personal best!",
+                        source="lap_completion_pb"
                     )
                 else:
                     delta = self.last_lap_time - self.best_lap_time
                     if delta > 0.5 and self.best_lap_time > 0:
-                        self.speaker.say(
-                            f"Lap {self.lap_count}. {lap_time_str}. "
-                            f"Plus {delta:.1f} to your best."
+                        self._speak(
+                            f"Lap {self.lap_count}. {lap_time_str}. Plus {delta:.1f} to your best.",
+                            source="lap_completion_delta"
                         )
-                    else:
-                        self.speaker.say(f"Lap {self.lap_count}. {lap_time_str}.")
             else:
-                self.speaker.say(f"Lap {self.lap_count}. All corners active.")
+                self._speak(f"Lap {self.lap_count}. All corners active.", source="lap_completion_all_active")
+            
+            # Compute strategic focus for next lap
+            if self.lap_count > 1 and len(self._corner_ready) == len(self.corners):
+                self.compute_lap_focus()
+            
             self._notify()
 
         self._record_corner_data(point)
@@ -515,6 +578,17 @@ class CoachingEngine:
                 return cx
         return None
 
+    def _get_entity_id(self, corner_idx: int, is_complex: bool = False) -> int:
+        """Map a corner (or complex) index to its coaching entity ID.
+        Complexes use negative IDs to match lap_focus_entities convention.
+        If a corner belongs to a complex, return that complex's entity ID."""
+        if is_complex:
+            return -corner_idx
+        for cx in self.complexes:
+            if corner_idx in cx.corner_indices:
+                return -cx.index
+        return corner_idx
+
     def _get_complex_role(self, corner_index: int, cx: Complex) -> str:
         if corner_index == cx.corner_indices[0]:
             return "entry"
@@ -535,16 +609,22 @@ class CoachingEngine:
         ct = self.composite.targets.get(corner.index) if self.composite else None
         instruction = self._generate_instruction(corner, ct)
 
+        # 2️⃣ When a coaching condition is met (just before generating a message)
+        if instruction:
+            log.info("🟢 Coaching condition met for corner %d", corner.index)
+
         cx = self._get_complex_for_corner(corner.index)
         if cx and instruction:
             role = self._get_complex_role(corner.index, cx)
             if role == "entry":
                 instruction = self._add_complex_approach_context(instruction, corner, cx)
 
+        # 3️⃣ Immediately after generating the coaching message string
         if instruction:
+            log.info("🗣 Generated coaching: %s", instruction)
             self.current_corner_label = f"C{corner.index}: {instruction}"
-            self.speaker.say_priority(instruction)
-        self._notify()
+            self._speak(instruction, source=f"approach_cue_C{corner.index}", priority=True)
+            self._notify()
 
     def _add_complex_approach_context(self, instruction: str, corner: Corner,
                                       cx: Complex) -> str:
@@ -568,6 +648,18 @@ class CoachingEngine:
 
     # ── Post-corner feedback ──
 
+
+
+
+
+
+
+
+
+
+
+
+
     def _check_post_cue(self, corner: Corner, point: TelPoint):
         if corner.index in self._post_fired:
             return
@@ -590,10 +682,12 @@ class CoachingEngine:
                 )
                 if promoted:
                     ct = self.composite.targets[corner.index]
-                    self.speaker.say_priority(
-                        f"Corner {corner.index} promoted to tier {ct.tier + 1}. "
-                        f"New target. Faster."
-                    )
+                    promotion_message = f"Corner {corner.index} promoted to tier {ct.tier + 1}. New target. Faster."
+                    # 2️⃣ When a coaching condition is met (just before generating a message)
+                    log.info("🟢 Coaching condition met for corner %d (promotion)", corner.index)
+                    # 3️⃣ Immediately after generating the coaching message string
+                    log.info("🗣 Generated coaching: %s", promotion_message)
+                    self._speak(promotion_message, source=f"corner_promotion_C{corner.index}", priority=True)
                 else:
                     # Try complex feedback first
                     complex_feedback = None
@@ -603,11 +697,19 @@ class CoachingEngine:
                             break
                     
                     if complex_feedback:
-                        self.speaker.say_priority(complex_feedback)
+                        # 2️⃣ When a coaching condition is met (just before generating a message)
+                        log.info("🟢 Coaching condition met for corner %d (complex feedback)", corner.index)
+                        # 3️⃣ Immediately after generating the coaching message string
+                        log.info("🗣 Generated coaching: %s", complex_feedback)
+                        self._speak(complex_feedback, source=f"complex_feedback_C{cx.index}", priority=True)
                     else:
                         feedback = self._generate_post_feedback(corner, ct, driver_trace)
                         if feedback:
-                            self.speaker.say_priority(feedback)
+                            # 2️⃣ When a coaching condition is met (just before generating a message)
+                            log.info("🟢 Coaching condition met for corner %d (post feedback)", corner.index)
+                            # 3️⃣ Immediately after generating the coaching message string
+                            log.info("🗣 Generated coaching: %s", feedback)
+                            self._speak(feedback, source=f"post_feedback_C{corner.index}", priority=True)
 
         zone_start = corner.brake_point_m - 50
         fresh_points = [p for p in self._all_points
@@ -625,6 +727,22 @@ class CoachingEngine:
     def _generate_instruction(self, corner: Corner,
                               ct: Optional[CornerTarget]) -> str:
         """Generate pre-corner instruction using enhanced phrases."""
+        # ── Focus Model Gate ──
+        if self.lap_focus_entities:
+            # Direct corner focus
+            if corner.index in self.lap_focus_entities:
+                pass
+            else:
+                # Check if part of a focused complex
+                in_focused_complex = any(
+                    -cx.index in self.lap_focus_entities
+                    and corner.index in cx.corner_indices
+                    for cx in self.complexes
+                )
+                
+                if not in_focused_complex:
+                    return ""
+        
         driver_trace = self._get_driver_trace_for_corner(corner)
         if not driver_trace:
             return ""
@@ -656,53 +774,76 @@ class CoachingEngine:
         if driver_brake_m is not None and ct:
             delta = driver_brake_m - ref_brake_m
             if delta < -8:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'brake_early')
                 msg = self.enhanced_coach.generate_pre(
                     corner.index, 'brake_early', delta=abs(delta),
                     complex_name=complex_name, corners=complex_corners
                 )
                 if msg:
+                    self._corner_advice_type[corner.index] = 'brake_early'
                     return msg
 
         if driver_apex and ct:
             delta = ref_apex_speed - driver_apex.speed_kph
             if delta > 8:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'apex_slow')
                 msg = self.enhanced_coach.generate_pre(
                     corner.index, 'apex_slow', delta=delta,
                     complex_name=complex_name, corners=complex_corners
                 )
                 if msg:
+                    self._corner_advice_type[corner.index] = 'apex_slow'
                     return msg
 
         if driver_exit and ct:
             delta = ref_exit_speed - driver_exit.speed_kph
             if delta > 10:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'exit_slow')
                 msg = self.enhanced_coach.generate_pre(
                     corner.index, 'exit_slow', delta=delta,
                     complex_name=complex_name, corners=complex_corners
                 )
                 if msg:
+                    self._corner_advice_type[corner.index] = 'exit_slow'
                     return msg
 
         if driver_apex and driver_brake_m:
             apex_brake_pt = driver_trace.get_at_dist(corner.apex_m, window=20)
             if apex_brake_pt and apex_brake_pt.brake_pct < 5:
-                brake_pts = [p for p in driver_trace.points 
+                brake_pts = [p for p in driver_trace.points
                            if corner.brake_point_m - 20 <= p.dist_m <= corner.brake_point_m + 50]
                 if brake_pts and max(p.brake_pct for p in brake_pts) > 60:
+                    self._record_corner_event(corner.index, 100, self.live_dist, 'no_trail_brake')
                     msg = self.enhanced_coach.generate_pre(
                         corner.index, 'no_trail_brake',
                         complex_name=complex_name, corners=complex_corners
                     )
                     if msg:
+                        self._corner_advice_type[corner.index] = 'no_trail_brake'
                         return msg
 
         return ""
 
-    # ── REPLACED: Enhanced post feedback ──
+    # ── Post feedback: compares this lap vs last lap on the coached metric ──
     def _generate_post_feedback(self, corner: Corner,
                                  ct: Optional[CornerTarget],
                                  driver_trace: LapTrace) -> str:
-        """Generate post-corner feedback using enhanced phrases."""
+        """Post-corner feedback. Compares this lap vs last lap on the specific
+        metric that was identified in the approach cue. Falls back to vs target
+        when no previous lap data is available."""
+        # ── Focus Model Gate ──
+        if self.lap_focus_entities:
+            if corner.index in self.lap_focus_entities:
+                pass
+            else:
+                in_focused_complex = any(
+                    -cx.index in self.lap_focus_entities
+                    and corner.index in cx.corner_indices
+                    for cx in self.complexes
+                )
+                if not in_focused_complex:
+                    return ""
+
         if not ct or not ct.target_trace:
             return ""
 
@@ -719,46 +860,145 @@ class CoachingEngine:
                     complex_corners = ','.join(str(i) for i in cx.corner_indices)
                 break
 
+        advice_type = self._corner_advice_type.get(corner.index)
+
+        # ── Compare vs previous lap if available ──
+        prev_data = self._prev_corner_data.get(corner.index)
+        if prev_data and len(prev_data) >= 5:
+            prev_trace = LapTrace(points=prev_data)
+
+            if advice_type == 'brake_early' and driver_brake_m:
+                prev_brake_m = prev_trace.find_brake_point(corner, search_range=250)
+                if prev_brake_m:
+                    delta = driver_brake_m - prev_brake_m  # positive = later = improved
+                    if delta > 5:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'improved_brake', delta=delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+                    else:
+                        target_delta = abs(driver_brake_m - ct.target_brake_m) if ct.target_brake_m else abs(delta)
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'brake_early', delta=target_delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+
+            elif advice_type == 'apex_slow' and driver_apex:
+                prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
+                if prev_apex:
+                    delta = driver_apex.speed_kph - prev_apex.speed_kph  # positive = faster = improved
+                    if delta > 3:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'improved_apex', delta=delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+                    else:
+                        remaining = ct.target_apex_speed - driver_apex.speed_kph
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'apex_slow', delta=abs(remaining),
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+
+            elif advice_type == 'exit_slow' and driver_exit:
+                prev_exit = prev_trace.get_at_dist(corner.exit_m, window=30)
+                if prev_exit:
+                    delta = driver_exit.speed_kph - prev_exit.speed_kph  # positive = faster = improved
+                    if delta > 3:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'improved_exit', delta=delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+                    else:
+                        remaining = ct.target_exit_speed - driver_exit.speed_kph
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'exit_slow', delta=abs(remaining),
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+
+            elif advice_type == 'no_trail_brake' and driver_apex:
+                prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
+                if prev_apex:
+                    delta = driver_apex.speed_kph - prev_apex.speed_kph
+                    if delta > 3:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'improved_apex', delta=delta,
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+                    else:
+                        msg = self.enhanced_coach.generate_post(
+                            corner.index, 'no_trail_brake',
+                            complex_name=complex_name, corners=complex_corners)
+                        if msg:
+                            return msg
+
+            else:
+                # No specific advice type — compare apex as general indicator
+                if driver_apex:
+                    prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
+                    if prev_apex:
+                        delta = driver_apex.speed_kph - prev_apex.speed_kph
+                        if delta > 3:
+                            msg = self.enhanced_coach.generate_post(
+                                corner.index, 'improved_apex', delta=delta,
+                                complex_name=complex_name, corners=complex_corners)
+                            if msg:
+                                return msg
+                        elif delta < -3:
+                            msg = self.enhanced_coach.generate_post(
+                                corner.index, 'apex_slow', delta=abs(delta),
+                                complex_name=complex_name, corners=complex_corners)
+                            if msg:
+                                return msg
+            return ""  # prev lap data exists but no message generated — stay silent
+
+        # ── No previous lap data: fall back to comparison vs composite target ──
         if driver_brake_m:
             delta = driver_brake_m - ct.target_brake_m
             if delta < -8:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'brake_early')
                 msg = self.enhanced_coach.generate_post(
                     corner.index, 'brake_early', delta=abs(delta),
-                    complex_name=complex_name, corners=complex_corners
-                )
+                    complex_name=complex_name, corners=complex_corners)
                 if msg:
                     return msg
 
         if driver_apex:
             delta = ct.target_apex_speed - driver_apex.speed_kph
             if delta > 8:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'apex_slow')
                 msg = self.enhanced_coach.generate_post(
                     corner.index, 'apex_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners
-                )
+                    complex_name=complex_name, corners=complex_corners)
                 if msg:
                     return msg
 
         if driver_exit:
             delta = ct.target_exit_speed - driver_exit.speed_kph
             if delta > 10:
+                self._record_corner_event(corner.index, delta, self.live_dist, 'exit_slow')
                 msg = self.enhanced_coach.generate_post(
                     corner.index, 'exit_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners
-                )
+                    complex_name=complex_name, corners=complex_corners)
                 if msg:
                     return msg
 
         if driver_apex and driver_brake_m:
             apex_brake_pt = driver_trace.get_at_dist(corner.apex_m, window=20)
             if apex_brake_pt and apex_brake_pt.brake_pct < 5:
-                brake_pts = [p for p in driver_trace.points 
+                brake_pts = [p for p in driver_trace.points
                            if corner.brake_point_m - 20 <= p.dist_m <= corner.brake_point_m + 50]
                 if brake_pts and max(p.brake_pct for p in brake_pts) > 60:
+                    self._record_corner_event(corner.index, 100, self.live_dist, 'no_trail_brake')
                     msg = self.enhanced_coach.generate_post(
                         corner.index, 'no_trail_brake',
-                        complex_name=complex_name, corners=complex_corners
-                    )
+                        complex_name=complex_name, corners=complex_corners)
                     if msg:
                         return msg
 
@@ -768,6 +1008,12 @@ class CoachingEngine:
     def _generate_complex_feedback(self, cx: Complex,
                                     driver_trace: LapTrace) -> str:
         """Generate sequence-level feedback for a corner complex."""
+        # ── Focus Model Gate ──
+        if self.lap_focus_entities:
+            # Check if this complex is in focus
+            if -cx.index not in self.lap_focus_entities:
+                return ""
+        
         if not hasattr(self, 'composite') or not self.composite:
             return ""
 
@@ -795,11 +1041,13 @@ class CoachingEngine:
         corners = ','.join(str(i) for i in cx.corner_indices)
 
         if min_diff > 15:
+            self._record_corner_event(cx.index, min_diff, self.live_dist, 'complex')
             return self.enhanced_coach.generate_pre(
                 cx.index, 'complex_min_speed', value=min_diff,
                 complex_name=cx.complex_type, corners=corners
             )
         elif exit_diff > 15:
+            self._record_corner_event(cx.index, exit_diff, self.live_dist, 'complex')
             return self.enhanced_coach.generate_pre(
                 cx.index, 'complex_exit_speed', value=exit_diff,
                 complex_name=cx.complex_type, corners=corners
@@ -807,10 +1055,7 @@ class CoachingEngine:
 
         return ""
 
-    def _generate_complex_feedback(self, cx: Complex,
-                                    driver_trace: LapTrace) -> str:
-        # ... [keep your existing complex feedback code] ...
-        pass
+    
 
     # ── Keep all your existing methods below this line ──
     # (escalate_feedback, _notify, etc.)
@@ -820,6 +1065,228 @@ class CoachingEngine:
         # ... [keep your existing code] ...
         pass
 
+            # ── Strategic Lap Focus Model ──
+    
+    def is_entity_in_focus(self, entity_idx: int) -> bool:
+        """Check if a corner or complex is in the current lap focus."""
+        return entity_idx in self.lap_focus_entities
+    
+    def compute_lap_focus(self):
+        """
+        Compute which entities (corners/complexes) to focus on for the next lap.
+        Uses PURE SECTOR DELTA RANKING (not heuristic estimation).
+        
+        Algorithm:
+        1. Use actual sector time deltas from sector_results
+        2. Map sectors to corners/complexes
+        3. Apply persistence, spacing, and limit constraints
+        """
+        if not self.sector_results:
+            return
+        
+        # 1. Calculate time loss per entity using ACTUAL SECTOR DELTAS
+        self.entity_time_loss.clear()
+        
+        # Map sector results to entities
+        for result in self.sector_results:
+            sector_idx = result.sector_idx
+            
+            # Get sector time delta (player vs target)
+            time_loss = result.delta_to_target if result.delta_to_target > 0 else 0
+            
+            # Skip if no significant time loss
+            if time_loss < FOCUS_PERSISTENCE_THRESHOLD_S:
+                continue
+            
+            # Find which entity this sector corresponds to
+            # First check if it's a complex
+            entity_found = False
+            for cx in self.complexes:
+                # Check if sector corresponds to this complex
+                # (Assuming sector index matches complex index for now)
+                if sector_idx == cx.index:
+                    # Use negative index for complexes
+                    self.entity_time_loss[-sector_idx] = time_loss
+                    entity_found = True
+                    break
+            
+            # If not a complex, check if it's a corner
+            if not entity_found:
+                # Check if sector corresponds to a corner
+                # (Assuming 1:1 mapping between sectors and corners for now)
+                for corner in self.corners:
+                    if corner.index == sector_idx:
+                        self.entity_time_loss[sector_idx] = time_loss
+                        break
+        
+        if not self.entity_time_loss:
+            self.lap_focus_entities.clear()
+            return
+        
+        # 2. Sort entities by time loss (descending) - PURE SECTOR DELTA RANKING
+        sorted_entities = sorted(
+            self.entity_time_loss.items(),
+            key=lambda x: x[1],  # Sort by actual sector time delta
+            reverse=True
+        )
+        
+        # 3. Apply persistence: keep entities from previous focus if still losing time
+        candidate_entities = set()
+        
+        for entity_idx, time_loss in sorted_entities:
+            # Keep if still losing significant time
+            if entity_idx in self.last_focus_entities and time_loss > FOCUS_PERSISTENCE_THRESHOLD_S:
+                candidate_entities.add(entity_idx)
+            
+            # Add new entities with significant time loss
+            elif entity_idx not in self.last_focus_entities and time_loss > FOCUS_PERSISTENCE_THRESHOLD_S:
+                candidate_entities.add(entity_idx)
+            
+            # Stop if we have enough candidates
+            if len(candidate_entities) >= MAX_FOCUS_ENTITIES * 2:  # Start with more, then filter
+                break
+        
+        # 4. Apply minimum spacing constraint
+        final_entities = set()
+        
+        # Convert entity indices to their approximate track positions
+        entity_positions = []
+        for entity_idx in candidate_entities:
+            if entity_idx > 0:  # Corner
+                corner = next((c for c in self.corners if c.index == entity_idx), None)
+                if corner:
+                    entity_positions.append((entity_idx, corner.apex_m))
+            else:  # Complex (negative index)
+                cx = next((c for c in self.complexes if c.index == -entity_idx), None)
+                if cx:
+                    entity_positions.append((entity_idx, (cx.start_m + cx.end_m) / 2))
+        
+        # Sort by track position
+        entity_positions.sort(key=lambda x: x[1])
+        
+        for entity_idx, position in entity_positions:
+            # Check spacing with already selected entities
+            too_close = False
+            for selected_idx, selected_pos in [(idx, pos) for idx, pos in entity_positions if idx in final_entities]:
+                if abs(position - selected_pos) < MIN_SPACING_M:
+                    too_close = True
+                    break
+            
+            if not too_close:
+                final_entities.add(entity_idx)
+                
+            if len(final_entities) >= MAX_FOCUS_ENTITIES:
+                break
+        
+        # 5. Update focus sets
+        self.last_focus_entities = self.lap_focus_entities.copy()
+        self.lap_focus_entities = final_entities
+        
+        # 6. Log the focus selection
+        if self.lap_focus_entities:
+            focus_desc = []
+            for entity_idx in self.lap_focus_entities:
+                if entity_idx > 0:
+                    focus_desc.append(f"C{entity_idx}")
+                else:
+                    cx = next((c for c in self.complexes if c.index == -entity_idx), None)
+                    if cx:
+                        corners_str = ','.join(str(i) for i in cx.corner_indices)
+                        focus_desc.append(f"Complex {cx.complex_type} (C{corners_str})")
+            
+            log.info("🎯 Lap focus entities (sector delta ranking): %s", ", ".join(focus_desc))
+            
+            # Announce focus for the next lap
+            if len(focus_desc) == 1:
+                self._speak(f"Focus on {focus_desc[0]} this lap.", source="focus_model")
+            elif len(focus_desc) > 1:
+                self._speak(f"Focus on {', '.join(focus_desc[:-1])} and {focus_desc[-1]} this lap.", source="focus_model")
+    
+        # Note: Heuristic time estimation methods removed in favor of pure sector delta ranking
+    
+    def _record_corner_event(self, corner_idx: int, delta: float, dist: float, issue_type: str):
+        """Record a corner delta event for later ranking."""
+        self.corner_events_this_lap.append({
+            'corner_idx': corner_idx,
+            'delta': delta,
+            'dist': dist,
+            'issue_type': issue_type,
+            'timestamp': time.time()
+        })
+        log.debug("📝 Recorded corner event: C%d delta=%.1f dist=%.0f issue=%s",
+                  corner_idx, delta, dist, issue_type)
+
+    def _can_speak(self, corner_idx: int, source: str, dist: float) -> bool:
+        """
+        Speech gate: hard budget cap only.
+        3 focus entities × (approach + post) = max 6 coaching messages per lap.
+        Approach/post dedup is handled upstream by _approach_fired/_post_fired sets.
+        """
+        if len(self.speeches_this_lap) >= self.speech_budget_max:
+            log.info("🗣️ Suppressed: budget full (%d of %d)",
+                     len(self.speeches_this_lap), self.speech_budget_max)
+            return False
+        return True
+
+    def _speak(self, text: str, source: str, priority: bool = False):
+        """
+        Structured logging wrapper for all speech with gate.
+        Logs WHO triggered speech, FROM WHICH METHOD, and CURRENT STATE.
+        """
+        # Whitelist of non-corner sources that bypass gate
+        non_corner_sources = {
+            'start_no_corners', 'start_coaching', 'stop',
+            'lap_completion_learning', 'lap_completion_pb', 'lap_completion_delta',
+            'lap_completion_all_active', 'focus_model', 'corner_promotion'
+        }
+        
+        corner_idx = None
+        # Try to parse corner index from source
+        import re
+        # pattern: approach_cue_C1, post_feedback_C2, corner_promotion_C3, complex_feedback_C4 (where 4 is complex index)
+        match = re.search(r'_C(\d+)', source)
+        if match:
+            corner_idx = int(match.group(1))
+        
+        # Determine if this is a corner-related speech that should be gated
+        is_corner_speech = corner_idx is not None and source not in non_corner_sources
+        
+        if is_corner_speech:
+            # Apply speech gate
+            if not self._can_speak(corner_idx, source, self.live_dist):
+                log.info("🗣️ SPEECH BLOCKED | source=%s | corner=%d | dist=%.0f",
+                         source, corner_idx, self.live_dist)
+                return  # Suppress speech
+        
+        # Log speech
+        log.info(
+            "🗣 SPEECH | source=%s | phase=%s | lap=%d | speed=%.1f | dist=%.0f | text=%s",
+            source,
+            self.phase,
+            self.lap_count,
+            self.live_speed,
+            self.live_dist,
+            text,
+        )
+        
+        # Record speech for budget tracking
+        if is_corner_speech:
+            is_complex_speech = 'complex_feedback' in source
+            entity_id = self._get_entity_id(corner_idx, is_complex=is_complex_speech)
+            self.speeches_this_lap.append({
+                'dist': self.live_dist,
+                'source': source,
+                'corner_idx': corner_idx,
+                'timestamp': time.time()
+            })
+            self.entities_spoken_this_lap.add(entity_id)
+        
+        # Deliver speech
+        if priority:
+            self.speaker.say_priority(text)
+        else:
+            self.speaker.say(text)
+    
     def _notify(self):
         if self.on_state_change:
             self.on_state_change()
@@ -936,6 +1403,27 @@ class EnhancedCoachingGenerator:
                 "{name}: {value:.0f}kph lost. Nail the last apex.",
                 "Exit loss in {name}. Last corner was the problem.",
                 "{name} exit slow. Perfect that final corner."
+            ],
+            'improved_brake_post': [
+                "C{idx}: {delta:.0f}m later on the brakes. That's it.",
+                "Better entry at {idx}. Braking later. Keep pushing that point.",
+                "C{idx}: brake point improved by {delta:.0f}m. Hold that confidence.",
+                "{idx}: later braking. Carry that forward.",
+                "C{idx}: better entry. That's the improvement we wanted."
+            ],
+            'improved_apex_post': [
+                "C{idx}: {delta:.0f}kph faster at the apex. Good.",
+                "Better through {idx}. {delta:.0f}kph up at the apex.",
+                "C{idx}: apex speed up {delta:.0f}kph. That's the improvement.",
+                "{idx}: carrying more speed. Keep that commitment.",
+                "C{idx}: {delta:.0f}kph gained at the apex. You found the grip."
+            ],
+            'improved_exit_post': [
+                "C{idx}: {delta:.0f}kph better on exit. Good.",
+                "Exit improved at {idx}. {delta:.0f}kph faster.",
+                "C{idx}: better exit speed. Keep hitting that apex.",
+                "{idx}: exit up {delta:.0f}kph. Apex is working.",
+                "C{idx}: good exit. That's exactly what we needed."
             ]
         }
     
@@ -982,6 +1470,8 @@ class EnhancedCoachingGenerator:
                                value=abs(value), name=complex_name, corners=corners)
         else:
             return phrase.format(idx=corner_idx, delta=abs(delta))
+
+
 
 
 
