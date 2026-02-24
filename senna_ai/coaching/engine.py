@@ -17,6 +17,7 @@ from senna_ai.coaching.coaching_constants import MIN_SPEED_MPS
 from senna_ai.coaching.coaching_constants import BRAKE_THRESHOLD
 from senna_ai.coaching.coaching_constants import TIER_PROMOTION_LAPS
 from senna_ai.infra.tts_engine import Speaker
+from senna_ai.coaching.race_engineer import RaceEngineerCoach
 
 log = logging.getLogger(__name__)
 
@@ -87,8 +88,8 @@ class CoachingEngine:
         self._issue_history: dict[tuple[int, str], int] = {}
         self._last_feedback: dict[int, str] = {}
         
-        # ADDED: Enhanced coaching
-        self.enhanced_coach = EnhancedCoachingGenerator()
+        # Speech generation: minimal race-engineer style
+        self.enhanced_coach = RaceEngineerCoach()
         
         # Strategic Lap Focus Model
         self.lap_focus_entities: Set[int] = set()  # Set of entity indices (corner or complex)
@@ -783,9 +784,8 @@ class CoachingEngine:
             delta = driver_brake_m - ref_brake_m
             if delta < -8:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'brake_early')
-                msg = self.enhanced_coach.generate_pre(
-                    corner.index, 'brake_early', delta=abs(delta),
-                    complex_name=complex_name, corners=complex_corners
+                msg = self.enhanced_coach.generate_instruction(
+                    corner.index, 'brake_early', complex_name=complex_name
                 )
                 if msg:
                     self._corner_advice_type[corner.index] = 'brake_early'
@@ -796,9 +796,8 @@ class CoachingEngine:
         if apex_dist is not None and apex_dist < corner.apex_m - 25:
             delta = corner.apex_m - apex_dist  # metres too early
             self._record_corner_event(corner.index, delta, self.live_dist, 'apex_early')
-            msg = self.enhanced_coach.generate_pre(
-                corner.index, 'apex_early', delta=delta,
-                complex_name=complex_name, corners=complex_corners
+            msg = self.enhanced_coach.generate_instruction(
+                corner.index, 'apex_early', complex_name=complex_name
             )
             if msg:
                 self._corner_advice_type[corner.index] = 'apex_early'
@@ -813,9 +812,8 @@ class CoachingEngine:
                 )
                 if dev is not None and abs(dev) > 1.5:
                     self._record_corner_event(corner.index, abs(dev), self.live_dist, 'line_wide')
-                    msg = self.enhanced_coach.generate_pre(
-                        corner.index, 'line_wide', delta=abs(dev),
-                        complex_name=complex_name, corners=complex_corners
+                    msg = self.enhanced_coach.generate_instruction(
+                        corner.index, 'line_wide', complex_name=complex_name
                     )
                     if msg:
                         self._corner_advice_type[corner.index] = 'line_wide'
@@ -825,9 +823,8 @@ class CoachingEngine:
             delta = ref_apex_speed - driver_apex.speed_kph
             if delta > 8:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'apex_slow')
-                msg = self.enhanced_coach.generate_pre(
-                    corner.index, 'apex_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners
+                msg = self.enhanced_coach.generate_instruction(
+                    corner.index, 'apex_slow', complex_name=complex_name
                 )
                 if msg:
                     self._corner_advice_type[corner.index] = 'apex_slow'
@@ -837,9 +834,8 @@ class CoachingEngine:
             delta = ref_exit_speed - driver_exit.speed_kph
             if delta > 10:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'exit_slow')
-                msg = self.enhanced_coach.generate_pre(
-                    corner.index, 'exit_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners
+                msg = self.enhanced_coach.generate_instruction(
+                    corner.index, 'exit_slow', complex_name=complex_name
                 )
                 if msg:
                     self._corner_advice_type[corner.index] = 'exit_slow'
@@ -852,9 +848,8 @@ class CoachingEngine:
                            if corner.brake_point_m - 20 <= p.dist_m <= corner.brake_point_m + 50]
                 if brake_pts and max(p.brake_pct for p in brake_pts) > 60:
                     self._record_corner_event(corner.index, 100, self.live_dist, 'no_trail_brake')
-                    msg = self.enhanced_coach.generate_pre(
-                        corner.index, 'no_trail_brake',
-                        complex_name=complex_name, corners=complex_corners
+                    msg = self.enhanced_coach.generate_instruction(
+                        corner.index, 'no_trail_brake', complex_name=complex_name
                     )
                     if msg:
                         self._corner_advice_type[corner.index] = 'no_trail_brake'
@@ -908,92 +903,58 @@ class CoachingEngine:
             if advice_type == 'brake_early' and driver_brake_m:
                 prev_brake_m = prev_trace.find_brake_point(corner, search_range=250)
                 if prev_brake_m:
-                    delta = driver_brake_m - prev_brake_m  # positive = later = improved
-                    if delta > 5:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'improved_brake', delta=delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
-                    else:
-                        target_delta = abs(driver_brake_m - ct.target_brake_m) if ct.target_brake_m else abs(delta)
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'brake_early', delta=target_delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
+                    improvement = driver_brake_m - prev_brake_m           # + = braked later = improved
+                    remaining   = ct.target_brake_m - driver_brake_m      # + = still needs to go later
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'brake_early',
+                        improvement=improvement, remaining=remaining)
+                    if msg:
+                        return msg
 
             elif advice_type == 'apex_slow' and driver_apex:
                 prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
                 if prev_apex:
-                    delta = driver_apex.speed_kph - prev_apex.speed_kph  # positive = faster = improved
-                    if delta > 3:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'improved_apex', delta=delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
-                    else:
-                        remaining = ct.target_apex_speed - driver_apex.speed_kph
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'apex_slow', delta=abs(remaining),
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
+                    improvement = driver_apex.speed_kph - prev_apex.speed_kph   # + = faster = improved
+                    remaining   = ct.target_apex_speed - driver_apex.speed_kph  # + = still slow
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'apex_slow',
+                        improvement=improvement, remaining=remaining)
+                    if msg:
+                        return msg
 
             elif advice_type == 'exit_slow' and driver_exit:
                 prev_exit = prev_trace.get_at_dist(corner.exit_m, window=30)
                 if prev_exit:
-                    delta = driver_exit.speed_kph - prev_exit.speed_kph  # positive = faster = improved
-                    if delta > 3:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'improved_exit', delta=delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
-                    else:
-                        remaining = ct.target_exit_speed - driver_exit.speed_kph
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'exit_slow', delta=abs(remaining),
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
+                    improvement = driver_exit.speed_kph - prev_exit.speed_kph   # + = faster = improved
+                    remaining   = ct.target_exit_speed - driver_exit.speed_kph  # + = still slow
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'exit_slow',
+                        improvement=improvement, remaining=remaining)
+                    if msg:
+                        return msg
 
             elif advice_type == 'no_trail_brake' and driver_apex:
                 prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
                 if prev_apex:
-                    delta = driver_apex.speed_kph - prev_apex.speed_kph
-                    if delta > 3:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'improved_apex', delta=delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
-                    else:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'no_trail_brake',
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
+                    improvement = driver_apex.speed_kph - prev_apex.speed_kph   # proxy: apex speed gain
+                    remaining   = ct.target_apex_speed - driver_apex.speed_kph
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'no_trail_brake',
+                        improvement=improvement, remaining=remaining)
+                    if msg:
+                        return msg
 
             elif advice_type == 'apex_early':
-                cur_apex_dist = self._find_apex_dist(driver_trace, corner)
+                cur_apex_dist  = self._find_apex_dist(driver_trace, corner)
                 prev_apex_dist = self._find_apex_dist(prev_trace, corner)
                 if cur_apex_dist is not None and prev_apex_dist is not None:
-                    delta = cur_apex_dist - prev_apex_dist  # positive = later this lap = improved
-                    if delta > 10:
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'improved_apex_early', delta=delta,
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
-                    else:
-                        remaining = corner.apex_m - cur_apex_dist
-                        msg = self.enhanced_coach.generate_post(
-                            corner.index, 'apex_early', delta=max(0, remaining),
-                            complex_name=complex_name, corners=complex_corners)
-                        if msg:
-                            return msg
+                    improvement = cur_apex_dist - prev_apex_dist          # + = apex later = improved
+                    remaining   = corner.apex_m - cur_apex_dist           # + = still early
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'apex_early',
+                        improvement=improvement, remaining=max(0.0, remaining))
+                    if msg:
+                        return msg
 
             elif advice_type == 'line_wide' and ct and ct.target_trace:
                 ref_trace_ct = ct.target_trace
@@ -1011,47 +972,37 @@ class CoachingEngine:
                                 prev_dev = ref_trace_ct.get_lateral_deviation(
                                     corner.apex_m, prev_pt.world_x, prev_pt.world_z)
                         if cur_dev is not None:
-                            if prev_dev is not None and (abs(prev_dev) - abs(cur_dev)) > 0.4:
-                                msg = self.enhanced_coach.generate_post(
-                                    corner.index, 'improved_line', delta=abs(prev_dev) - abs(cur_dev),
-                                    complex_name=complex_name, corners=complex_corners)
-                                if msg:
-                                    return msg
-                            else:
-                                msg = self.enhanced_coach.generate_post(
-                                    corner.index, 'line_wide', delta=abs(cur_dev),
-                                    complex_name=complex_name, corners=complex_corners)
-                                if msg:
-                                    return msg
+                            improvement = (abs(prev_dev) - abs(cur_dev)) if prev_dev is not None else 0.0
+                            remaining   = abs(cur_dev)                    # how far still wide
+                            msg = self.enhanced_coach.generate_assessment(
+                                corner.index, 'line_wide',
+                                improvement=improvement, remaining=remaining)
+                            if msg:
+                                return msg
 
             else:
-                # No specific advice type — compare apex as general indicator
+                # No specific advice type — use apex speed as general indicator
                 if driver_apex:
                     prev_apex = prev_trace.get_at_dist(corner.apex_m, window=30)
                     if prev_apex:
-                        delta = driver_apex.speed_kph - prev_apex.speed_kph
-                        if delta > 3:
-                            msg = self.enhanced_coach.generate_post(
-                                corner.index, 'improved_apex', delta=delta,
-                                complex_name=complex_name, corners=complex_corners)
-                            if msg:
-                                return msg
-                        elif delta < -3:
-                            msg = self.enhanced_coach.generate_post(
-                                corner.index, 'apex_slow', delta=abs(delta),
-                                complex_name=complex_name, corners=complex_corners)
+                        improvement = driver_apex.speed_kph - prev_apex.speed_kph
+                        remaining   = ct.target_apex_speed - driver_apex.speed_kph
+                        if abs(improvement) > 1.0:  # only speak if measurable change
+                            msg = self.enhanced_coach.generate_assessment(
+                                corner.index, 'apex_slow',
+                                improvement=improvement, remaining=remaining)
                             if msg:
                                 return msg
             return ""  # prev lap data exists but no message generated — stay silent
 
-        # ── No previous lap data: fall back to comparison vs composite target ──
+        # ── No previous lap data: first-pass assessment vs composite target ──
         if driver_brake_m:
             delta = driver_brake_m - ct.target_brake_m
             if delta < -8:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'brake_early')
-                msg = self.enhanced_coach.generate_post(
-                    corner.index, 'brake_early', delta=abs(delta),
-                    complex_name=complex_name, corners=complex_corners)
+                msg = self.enhanced_coach.generate_assessment(
+                    corner.index, 'brake_early',
+                    improvement=0, remaining=abs(delta))
                 if msg:
                     return msg
 
@@ -1059,9 +1010,9 @@ class CoachingEngine:
             delta = ct.target_apex_speed - driver_apex.speed_kph
             if delta > 8:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'apex_slow')
-                msg = self.enhanced_coach.generate_post(
-                    corner.index, 'apex_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners)
+                msg = self.enhanced_coach.generate_assessment(
+                    corner.index, 'apex_slow',
+                    improvement=0, remaining=delta)
                 if msg:
                     return msg
 
@@ -1069,9 +1020,9 @@ class CoachingEngine:
             delta = ct.target_exit_speed - driver_exit.speed_kph
             if delta > 10:
                 self._record_corner_event(corner.index, delta, self.live_dist, 'exit_slow')
-                msg = self.enhanced_coach.generate_post(
-                    corner.index, 'exit_slow', delta=delta,
-                    complex_name=complex_name, corners=complex_corners)
+                msg = self.enhanced_coach.generate_assessment(
+                    corner.index, 'exit_slow',
+                    improvement=0, remaining=delta)
                 if msg:
                     return msg
 
@@ -1082,9 +1033,10 @@ class CoachingEngine:
                            if corner.brake_point_m - 20 <= p.dist_m <= corner.brake_point_m + 50]
                 if brake_pts and max(p.brake_pct for p in brake_pts) > 60:
                     self._record_corner_event(corner.index, 100, self.live_dist, 'no_trail_brake')
-                    msg = self.enhanced_coach.generate_post(
+                    remaining = ct.target_apex_speed - driver_apex.speed_kph if ct else 0
+                    msg = self.enhanced_coach.generate_assessment(
                         corner.index, 'no_trail_brake',
-                        complex_name=complex_name, corners=complex_corners)
+                        improvement=0, remaining=max(0, remaining))
                     if msg:
                         return msg
 
@@ -1093,9 +1045,9 @@ class CoachingEngine:
         if apex_dist is not None and apex_dist < corner.apex_m - 25:
             delta = corner.apex_m - apex_dist
             self._record_corner_event(corner.index, delta, self.live_dist, 'apex_early')
-            msg = self.enhanced_coach.generate_post(
-                corner.index, 'apex_early', delta=delta,
-                complex_name=complex_name, corners=complex_corners)
+            msg = self.enhanced_coach.generate_assessment(
+                corner.index, 'apex_early',
+                improvement=0, remaining=delta)
             if msg:
                 return msg
 
@@ -1106,9 +1058,9 @@ class CoachingEngine:
                     corner.apex_m, drv_pt.world_x, drv_pt.world_z)
                 if dev is not None and abs(dev) > 1.5:
                     self._record_corner_event(corner.index, abs(dev), self.live_dist, 'line_wide')
-                    msg = self.enhanced_coach.generate_post(
-                        corner.index, 'line_wide', delta=abs(dev),
-                        complex_name=complex_name, corners=complex_corners)
+                    msg = self.enhanced_coach.generate_assessment(
+                        corner.index, 'line_wide',
+                        improvement=0, remaining=abs(dev))
                     if msg:
                         return msg
 
@@ -1152,15 +1104,13 @@ class CoachingEngine:
 
         if min_diff > 15:
             self._record_corner_event(cx.index, min_diff, self.live_dist, 'complex')
-            return self.enhanced_coach.generate_pre(
-                cx.index, 'complex_min_speed', value=min_diff,
-                complex_name=cx.complex_type, corners=corners
+            return self.enhanced_coach.generate_instruction(
+                cx.index, 'complex_min_speed', complex_name=cx.complex_type
             )
         elif exit_diff > 15:
             self._record_corner_event(cx.index, exit_diff, self.live_dist, 'complex')
-            return self.enhanced_coach.generate_pre(
-                cx.index, 'complex_exit_speed', value=exit_diff,
-                complex_name=cx.complex_type, corners=corners
+            return self.enhanced_coach.generate_instruction(
+                cx.index, 'complex_exit_speed', complex_name=cx.complex_type
             )
 
         return ""
