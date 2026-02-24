@@ -2,6 +2,7 @@
 from __future__ import annotations
 import time
 import math
+from collections import deque
 from typing import List, Optional, Dict, Set, Tuple
 import logging
 
@@ -107,6 +108,17 @@ class CoachingEngine:
         # Per-lap comparison tracking
         self._prev_corner_data: dict[int, list[TelPoint]] = {}  # corner data from previous lap
         self._corner_advice_type: dict[int, str] = {}  # issue type from approach cue given this lap
+
+        # ── Section engine state ──────────────────────────────────────────────
+        # Reset each lap (which sections have fired)
+        self._section_approach_fired: set[int] = set()    # cx.index values with approach cue fired
+        self._section_post_fired:     set[int] = set()    # cx.index values with post cue fired
+        # Timing within current lap (reset each lap)
+        self._section_enter_time:     dict[int, float] = {}   # cx.index → timestamp at cx.start_m
+        self._section_exit_time:      dict[int, float] = {}   # cx.index → timestamp at cx.end_m
+        # Cross-lap history (NOT reset each lap)
+        self._section_lap_times:      dict[int, deque]  = {}  # cx.index → deque(maxlen=5) of times
+        self._section_best_time:      dict[int, float]  = {}  # cx.index → fastest time seen
 
     def set_reference_laps(self, laps: list[RefLapFile]):
         """Set ALL reference laps for the current track. Builds composite."""
@@ -309,6 +321,11 @@ class CoachingEngine:
             # Save corner data snapshot for post-feedback comparison next lap
             self._prev_corner_data = {k: list(v) for k, v in self._corner_data.items()}
             self._corner_advice_type.clear()
+            # Reset section engine for new lap (history deques persist across laps)
+            self._section_approach_fired.clear()
+            self._section_post_fired.clear()
+            self._section_enter_time.clear()
+            self._section_exit_time.clear()
             # Reset speech tracking for new lap
             self.corner_events_this_lap.clear()
             self.speeches_this_lap.clear()
@@ -372,6 +389,12 @@ class CoachingEngine:
 
         self._record_corner_data(point)
         self._check_sector_crossing(point)
+
+        # Section engine — runs before corner loop so briefings fire first
+        for cx in self.complexes:
+            self._update_section_timing(cx, point)
+            self._check_section_approach_cue(cx, point)
+            self._check_section_post_cue(cx, point)
 
         for corner in self.corners:
             if corner.index in self._corner_ready:
@@ -606,6 +629,11 @@ class CoachingEngine:
         return "mid"
 
     def _check_approach_cue(self, corner: Corner, point: TelPoint):
+        # Section engine gate: suppress individual cue if section briefing already fired
+        cx = self._get_complex_for_corner(corner.index)
+        if cx is not None and cx.index in self._section_approach_fired:
+            return
+
         if corner.index in self._approach_fired:
             return
         if abs(point.dist_m - corner.approach_m) > APPROACH_WINDOW_M:
@@ -677,6 +705,12 @@ class CoachingEngine:
             return
 
         self._post_fired.add(corner.index)
+
+        # Section engine gate: suppress all individual corner feedback if section owns this complex
+        cx = self._get_complex_for_corner(corner.index)
+        if cx is not None and cx.index in self._section_approach_fired:
+            return
+
         self.current_corner_label = ""
         self._notify()
 
@@ -1117,8 +1151,125 @@ class CoachingEngine:
 
     
 
-    # ── Keep all your existing methods below this line ──
-    # (escalate_feedback, _notify, etc.)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Section Engine Methods
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _update_section_timing(self, cx: Complex, point: TelPoint):
+        """Track when the driver enters and exits a section each lap."""
+        # Record entry: first point at or beyond section start
+        if cx.index not in self._section_enter_time:
+            if point.dist_m >= cx.start_m:
+                self._section_enter_time[cx.index] = point.timestamp
+
+        # Record exit and compute section time
+        if (cx.index in self._section_enter_time
+                and cx.index not in self._section_exit_time
+                and point.dist_m >= cx.end_m):
+            self._section_exit_time[cx.index] = point.timestamp
+            section_time = point.timestamp - self._section_enter_time[cx.index]
+
+            if cx.index not in self._section_lap_times:
+                self._section_lap_times[cx.index] = deque(maxlen=5)
+            self._section_lap_times[cx.index].append(section_time)
+
+            # Update personal best for this section
+            if (cx.index not in self._section_best_time
+                    or section_time < self._section_best_time[cx.index]):
+                self._section_best_time[cx.index] = section_time
+
+            log.debug("Section '%s' time=%.3fs best=%.3fs",
+                      cx.name, section_time, self._section_best_time[cx.index])
+
+    def _check_section_approach_cue(self, cx: Complex, point: TelPoint):
+        """Fire section briefing ~SECTION_APPROACH_M before section entry."""
+        if cx.index in self._section_approach_fired:
+            return
+
+        trigger_dist = cx.start_m - SECTION_APPROACH_M
+        if abs(point.dist_m - trigger_dist) > APPROACH_WINDOW_M:
+            return
+        if point.dist_m > cx.start_m:
+            return  # Already inside — missed window
+
+        # Focus model gate: only coach in-focus sections
+        if self.lap_focus_entities and -cx.index not in self.lap_focus_entities:
+            return
+
+        self._section_approach_fired.add(cx.index)
+
+        bottleneck = self._get_section_bottleneck(cx)
+        msg = self.enhanced_coach.generate_section_instruction(
+            cx.index,
+            cx.complex_type,
+            complex_name=cx.name,
+            bottleneck_corner_idx=bottleneck,
+        )
+        if msg:
+            log.info("🟢 Section approach: '%s' bottleneck=T%d", cx.name, bottleneck)
+            log.info("🗣 Generated coaching: %s", msg)
+            self._speak(msg, source=f"section_approach_{cx.index}", priority=True)
+            self._notify()
+
+    def _check_section_post_cue(self, cx: Complex, point: TelPoint):
+        """Fire section time assessment after the final exit."""
+        if cx.index in self._section_post_fired:
+            return
+        if cx.index not in self._section_approach_fired:
+            return  # No briefing this lap -> no assessment
+
+        post_dist = cx.end_m + POST_CORNER_M
+        if abs(point.dist_m - post_dist) > APPROACH_WINDOW_M:
+            return
+
+        self._section_post_fired.add(cx.index)
+
+        history = self._section_lap_times.get(cx.index)
+        if not history or len(history) < 2:
+            return  # First completed pass — no comparison data yet
+
+        times = list(history)
+        this_time = times[-1]
+        prev_time = times[-2]
+        best_time = self._section_best_time.get(cx.index, this_time)
+
+        improvement = prev_time - this_time       # positive = faster this lap
+        remaining   = this_time - best_time       # positive = still off personal best
+
+        msg = self.enhanced_coach.generate_section_assessment(
+            cx.index, improvement, remaining
+        )
+        if msg:
+            log.info("🟢 Section post: '%s' improvement=%.3fs remaining=%.3fs",
+                     cx.name, improvement, remaining)
+            log.info("🗣 Generated coaching: %s", msg)
+            self._speak(msg, source=f"section_post_{cx.index}", priority=True)
+            self._notify()
+
+    def _get_section_bottleneck(self, cx: Complex) -> int:
+        """
+        Return the corner_idx with the greatest apex-speed deficit vs reference
+        within this complex. Returns 0 if data is unavailable.
+        """
+        if not self.composite:
+            return 0
+        worst_idx = 0
+        worst_delta = 0.0
+        for corner in cx.corners:
+            ct = self.composite.targets.get(corner.index)
+            if not ct or ct.target_apex_speed <= 0:
+                continue
+            prev_data = self._prev_corner_data.get(corner.index, [])
+            if not prev_data:
+                continue
+            prev_trace = LapTrace(points=prev_data)
+            apex_pt = prev_trace.get_at_dist(corner.apex_m, window=30)
+            if apex_pt:
+                delta = ct.target_apex_speed - apex_pt.speed_kph
+                if delta > worst_delta:
+                    worst_delta = delta
+                    worst_idx = corner.index
+        return worst_idx
 
     def _escalate_feedback(self, prefix: str, tag: str, base_msg: str,
                             count: int, corner: Corner) -> str:

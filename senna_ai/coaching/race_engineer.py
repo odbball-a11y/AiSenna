@@ -38,6 +38,8 @@ ISSUE_THRESHOLDS: Dict[str, Dict[str, float]] = {
     'complex_min_speed':  {'strong': 10,  'small': 4,   'noise': 2,   'achieved': 5  },
     'complex_exit_speed': {'strong': 10,  'small': 4,   'noise': 2,   'achieved': 5  },
     'brake_stab':         {'strong': 5,   'small': 2,   'noise': 1,   'achieved': 3  },
+    # Section-level time delta (seconds) — used by generate_section_assessment
+    'section_time':       {'strong': 0.5, 'small': 0.2, 'noise': 0.1, 'achieved': 0.2},
 }
 
 _DEFAULT_THRESHOLDS = {'strong': 10, 'small': 4, 'noise': 2, 'achieved': 5}
@@ -94,6 +96,39 @@ TREND_PHRASES: Dict[str, list] = {
 # Positive buckets used for trend detection
 _POSITIVE_BUCKETS = {'small', 'strong', 'achieved'}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Section-level phrase libraries
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Section briefing phrases — keyed by Complex.complex_type
+# Format token: {name} = section display name
+SECTION_INSTRUCTIONS: Dict[str, list] = {
+    'flow_zone':   ["{name}. Flow through.",    "{name}. Commit early.",       "{name}. Carry momentum." ],
+    'esses':       ["{name}. Flow through.",    "{name}. Link the apexes.",    "{name}. Keep the rhythm."],
+    'chicane':     ["{name}. Hit both apexes.", "{name}. Straight line through."                         ],
+    'double_apex': ["{name}. Link them up.",    "{name}. Carry to the second."                           ],
+    'linked':      ["{name}. Momentum first.",  "{name}. Build through."                                 ],
+    'default':     ["{name}. Focus.",           "{name}. Smooth through."                                ],
+}
+
+# Bottleneck hint — fires when a specific corner is the biggest speed deficit
+# Format tokens: {name} = section name, {corner} = corner number
+SECTION_BOTTLENECK_PHRASES: list = [
+    "{name}. T{corner}. Carry more.",
+    "{name}. T{corner}. Don't back off.",
+]
+
+# Post-section assessment phrases — same 6-bucket schema, time-based
+# Format token: {gap} = time gap formatted as seconds (small bucket only)
+SECTION_ASSESSMENT_PHRASES: Dict[str, list] = {
+    'no_change':  ["Same time.",       "No change.",      "Hold there."     ],
+    'small':      ["Better. {gap}.",   "Good step.",      "Closer."         ],
+    'strong':     ["Good run.",        "Big step.",       "That's progress."],
+    'achieved':   ["On pace.",         "That's it.",      "Match held."     ],
+    'regression': ["Slower.",          "Lost time.",      "That slipped."   ],
+    'overshoot':  ["Under target.",    "Ahead of pace.",  "Easy."           ],
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RaceEngineerCoach
@@ -103,9 +138,13 @@ class RaceEngineerCoach:
     """
     Minimal, professional race engineer speech generation.
 
-    Two modes:
-      generate_instruction()  — pre-corner, directional instruction
-      generate_assessment()   — post-corner, behavioural evaluation with trend
+    Corner modes:
+      generate_instruction()         — pre-corner, directional instruction
+      generate_assessment()          — post-corner, behavioural evaluation with trend
+
+    Section modes:
+      generate_section_instruction() — pre-section briefing (one thought before the complex)
+      generate_section_assessment()  — post-section verdict (time-based, 6-bucket)
     """
 
     def __init__(self):
@@ -114,8 +153,13 @@ class RaceEngineerCoach:
         self._assess_idx: Dict[str, int] = {}
         self._trend_idx:  Dict[str, int] = {}
 
+        # Section rotation state
+        self._section_instr_idx:  Dict[str, int] = {}
+        self._section_assess_idx: Dict[str, int] = {}
+
         # Per-corner, per-issue classification history (last 3 laps)
         # Key format: "C{corner_idx}_{issue_type}"
+        # Section history uses key format: "S{complex_idx}"
         self._delta_history: Dict[str, deque] = {}
 
     # ─────────────────────────────────────────────
@@ -193,6 +237,97 @@ class RaceEngineerCoach:
         return text
 
     # ─────────────────────────────────────────────
+    # Public: Section mode (pre-section briefing)
+    # ─────────────────────────────────────────────
+
+    def generate_section_instruction(self, complex_idx: int, complex_type: str,
+                                     complex_name: str = "",
+                                     bottleneck_corner_idx: int = 0) -> str:
+        """
+        Generate a pre-section briefing phrase.
+
+        If a bottleneck corner is known (biggest speed gap), use the bottleneck
+        phrase to focus the driver on that specific point.  Otherwise fall back
+        to a generic complex-type phrase.
+
+        Args:
+            complex_idx:           Complex index (used for rotation key only)
+            complex_type:          e.g. 'flow_zone', 'esses', 'chicane', etc.
+            complex_name:          Display name (e.g. "Maggots-Becketts")
+            bottleneck_corner_idx: Corner with the biggest speed deficit (0 = unknown)
+        """
+        display = complex_name or complex_type
+
+        if bottleneck_corner_idx > 0:
+            key = "section_bottleneck"
+            phrase = self._rotate(self._section_instr_idx, key, SECTION_BOTTLENECK_PHRASES)
+            try:
+                text = phrase.format(name=display, corner=bottleneck_corner_idx)
+            except KeyError:
+                text = phrase
+            text = self._enforce_word_limit(text)
+            log.debug("SECTION INSTRUCTION [%s] bottleneck=T%d: %s",
+                      display, bottleneck_corner_idx, text)
+            return text
+
+        phrases = SECTION_INSTRUCTIONS.get(complex_type, SECTION_INSTRUCTIONS['default'])
+        key = f"section_{complex_type}"
+        phrase = self._rotate(self._section_instr_idx, key, phrases)
+        try:
+            text = phrase.format(name=display)
+        except KeyError:
+            text = phrase
+        text = self._enforce_word_limit(text)
+        log.debug("SECTION INSTRUCTION [%s] type=%s: %s", display, complex_type, text)
+        return text
+
+    # ─────────────────────────────────────────────
+    # Public: Section mode (post-section assessment)
+    # ─────────────────────────────────────────────
+
+    def generate_section_assessment(self, complex_idx: int,
+                                    improvement: float, remaining: float) -> str:
+        """
+        Generate a post-section time-based assessment.
+
+        Args:
+            complex_idx: Complex index (for history key and rotation)
+            improvement: prev_section_time - this_section_time  (positive = faster)
+            remaining:   this_section_time - personal_best_time (positive = off best)
+        """
+        bucket = self._classify('section_time', improvement, remaining)
+
+        hist_key = f"S{complex_idx}"
+        if hist_key not in self._delta_history:
+            self._delta_history[hist_key] = deque(maxlen=3)
+        self._delta_history[hist_key].append(bucket)
+
+        # Trend check using raw history key
+        trend_key = self._get_trend_by_key(hist_key)
+        if trend_key:
+            text = self._rotate(self._trend_idx, trend_key, TREND_PHRASES[trend_key])
+            text = self._enforce_word_limit(text)
+            log.debug("SECTION ASSESSMENT S%d → TREND %s: %s", complex_idx, trend_key, text)
+            return text
+
+        phrases = SECTION_ASSESSMENT_PHRASES.get(bucket, [])
+        if not phrases:
+            return ""
+
+        phrase = self._rotate(self._section_assess_idx, bucket, phrases)
+
+        # Format {gap} as seconds (only the 'small' bucket uses it)
+        gap_str = f"{abs(remaining):.1f}s"
+        try:
+            text = phrase.format(gap=gap_str)
+        except KeyError:
+            text = phrase
+
+        text = self._enforce_word_limit(text)
+        log.debug("SECTION ASSESSMENT S%d → %s: %s", complex_idx, bucket, text)
+        return text
+
+    # ─────────────────────────────────────────────
     # Classification
     # ─────────────────────────────────────────────
 
@@ -252,6 +387,28 @@ class RaceEngineerCoach:
             return 'trend_3'
 
         # Last 2 consecutive positive
+        if all(b in _POSITIVE_BUCKETS for b in buckets[-2:]):
+            return 'trend_2'
+
+        return None
+
+    def _get_trend_by_key(self, hist_key: str) -> Optional[str]:
+        """
+        Check trend by raw history key (e.g. 'S{complex_idx}').
+        Identical logic to _get_trend() but takes the key directly.
+        """
+        history = self._delta_history.get(hist_key)
+        if not history:
+            return None
+
+        buckets = list(history)
+
+        if len(buckets) < 2:
+            return None
+
+        if len(buckets) >= 3 and all(b in _POSITIVE_BUCKETS for b in buckets[-3:]):
+            return 'trend_3'
+
         if all(b in _POSITIVE_BUCKETS for b in buckets[-2:]):
             return 'trend_2'
 
