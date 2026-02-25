@@ -391,7 +391,7 @@ def print_maggots_diagnostic(
     bottleneck_idx = engine._get_section_bottleneck(mb_cx)
     if bottleneck_idx:
         corner_obj = next((c for c in mb_cx.corners if c.index == bottleneck_idx), None)
-        name_str   = f" ({corner_obj.name})" if corner_obj and corner_obj.name else ""
+        name_str   = ""  # Corner has no .name attribute
         print(f"  │   Bottleneck: T{bottleneck_idx}{name_str}")
     else:
         print("  │   Bottleneck: none (no _prev_corner_data for this complex yet)")
