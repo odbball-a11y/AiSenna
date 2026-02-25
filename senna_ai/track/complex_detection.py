@@ -120,13 +120,17 @@ def _detect_steering_flow_zones(traces: list[LapTrace],
 
 def _detect_driver_reset(trace: LapTrace, start_m: float, end_m: float) -> bool:
     """Detect if driver resets between corners (full throttle, minimal steering).
-    
+
     Returns True if a reset is detected (corners should NOT be merged).
     A reset is detected when ALL of the following occur between start_m and end_m:
     1. Sustained throttle > 85% for at least 0.8 seconds
     2. Steering magnitude RMS < 1.5% for at least 0.5 seconds
-    3. Brake = 0 during that window
-    4. Lateral G below low-load threshold (0.3g)
+    3. Lateral G below low-load threshold (0.3g)
+
+    Note: brake pressure is deliberately NOT checked here — drivers often breathe
+    the brake through high-speed flow zones (e.g. Maggots–Becketts) while still
+    maintaining throttle dominance.  Including brake=0 as a hard gate caused
+    97.7% of valid reference laps to falsely fire as resets.
     """
     # Get points in the reset window
     reset_points = [p for p in trace.points if start_m <= p.dist_m <= end_m]
@@ -157,12 +161,7 @@ def _detect_driver_reset(trace: LapTrace, start_m: float, end_m: float) -> bool:
         throttle_ok = all(p.throttle_pct > throttle_threshold for p in window)
         if not throttle_ok:
             continue
-            
-        # Check brake condition (must be 0)
-        brake_ok = all(p.brake_pct == 0 for p in window)
-        if not brake_ok:
-            continue
-            
+
         # Check for low steering within this throttle window
         # We need at least min_steering_points consecutive points with low steering
         for j in range(len(window) - min_steering_points + 1):
@@ -282,16 +281,19 @@ def detect_complexes(corners: list[Corner], ref_traces: list[LapTrace] = None) -
         # Check 2: For corners within 700m apex gap, check steering continuity
         # Key fix: check steering BEFORE rejecting on distance
         if apex_gap < 700 and ref_traces:
-            # NEW: First check for driver reset between corners
-            reset_detected = False
-            for trace in ref_traces[:5]:
-                if _detect_driver_reset(trace, c1.exit_m, c2.brake_point_m):
-                    reset_detected = True
-                    log.debug("Reset detected between C%d and C%d - NOT merging", c1.index, c2.index)
-                    break
-            
-            if reset_detected:
-                # Driver reset detected - do NOT merge these corners
+            # Majority-vote reset check: >50% of reference traces must detect a
+            # reset before we block the merge.  A single bad lap (e.g. one that
+            # brushes the brake) previously caused the entire complex to fragment.
+            _traces_to_check = ref_traces[:5]
+            _reset_count = sum(
+                1 for trace in _traces_to_check
+                if _detect_driver_reset(trace, c1.exit_m, c2.brake_point_m)
+            )
+            if _reset_count > len(_traces_to_check) // 2:
+                log.debug(
+                    "Reset majority (%d/%d traces) between C%d and C%d - NOT merging",
+                    _reset_count, len(_traces_to_check), c1.index, c2.index,
+                )
                 continue
             
             # Original steering continuity check (only if no reset detected)
@@ -360,7 +362,39 @@ def detect_complexes(corners: list[Corner], ref_traces: list[LapTrace] = None) -
         cidx = [corners[i].index for i in indices]
         speeds = [c.apex_speed_kph for c in ccorners]
         avg_speed = sum(speeds) / len(speeds) if speeds else 0
-        if avg_speed > 150:
+
+        # Steering-behaviour metrics for classification.
+        # avg_speed alone is unreliable when only 2 corners are detected (e.g.
+        # Maggots–Becketts where the under-detected apex at 94 kph drags the
+        # average below 150).  A complex that shows high steering RMS + repeated
+        # direction changes in the reference traces is behaviorally an "esses"
+        # regardless of the apex-speed average.
+        _cx_start = ccorners[0].brake_point_m
+        _cx_end   = ccorners[-1].exit_m
+        _steer_rms_vals: list[float] = []
+        _sign_change_vals: list[int] = []
+        if ref_traces:
+            for _trace in ref_traces[:5]:
+                _bpts = [p for p in _trace.points if _cx_start <= p.dist_m <= _cx_end]
+                if len(_bpts) >= 10:
+                    _rms = math.sqrt(sum(p.steer_pct ** 2 for p in _bpts) / len(_bpts))
+                    _steer_rms_vals.append(_rms)
+                    _signs = [
+                        1 if p.steer_pct > 2.0 else (-1 if p.steer_pct < -2.0 else 0)
+                        for p in _bpts
+                    ]
+                    _changes = sum(
+                        1 for _j in range(1, len(_signs))
+                        if _signs[_j] != 0 and _signs[_j - 1] != 0
+                        and _signs[_j] != _signs[_j - 1]
+                    )
+                    _sign_change_vals.append(_changes)
+        _avg_steer_rms    = (sum(_steer_rms_vals)    / len(_steer_rms_vals))    if _steer_rms_vals    else 0.0
+        _avg_sign_changes = (sum(_sign_change_vals) / len(_sign_change_vals)) if _sign_change_vals else 0.0
+        # Flow-zone behavioural signature: high steering workload + oscillating direction
+        _steer_flow = _avg_steer_rms > 10.0 and _avg_sign_changes >= 3.0 and avg_speed > 100
+
+        if avg_speed > 150 or _steer_flow:
             ctype = "esses"
         elif avg_speed < 80 and len(ccorners) <= 3:
             ctype = "chicane"

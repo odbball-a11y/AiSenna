@@ -148,6 +148,14 @@ class CoachingEngine:
             log.warning("No reference laps have detected corners — cannot build composite.")
             return
 
+        # Remove isolated fast-cluster outliers (cheat laps, flying laps, in-laps)
+        from senna_ai.data.lap_scanner import filter_laps_by_cluster
+        filtered = filter_laps_by_cluster(viable, gap_threshold=5.0)
+        if filtered:
+            viable = filtered
+        else:
+            log.warning("Cluster filter removed all laps — falling back to unfiltered set.")
+
         from collections import Counter
         corner_counts = Counter(len(l.corners) for l in viable)
         modal_count = corner_counts.most_common(1)[0][0]
