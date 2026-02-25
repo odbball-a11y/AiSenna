@@ -224,11 +224,18 @@ def _compute_complex_metrics(cx: Complex, ref_traces: list[LapTrace]) -> None:
              (-1 if p.steer_pct < -steer_thresh else 0)
              for p in zone_points]
     
+    # Count direction changes through brief neutral zones.
+    # Consecutive-pairs approach misses transitions where steer briefly crosses
+    # below the 2% threshold (e.g. Maggots→Becketts at 160kph: +1+1 0 0 -1-1).
+    # Track the last non-zero sign and increment when it changes.
     direction_changes = 0
-    for j in range(1, len(signs)):
-        if signs[j] != 0 and signs[j-1] != 0 and signs[j] != signs[j-1]:
-            direction_changes += 1
-    
+    _last_nonzero = 0
+    for _sign in signs:
+        if _sign != 0:
+            if _last_nonzero != 0 and _sign != _last_nonzero:
+                direction_changes += 1
+            _last_nonzero = _sign
+
     cx.n_direction_changes = direction_changes
     
     # Compute speed metrics
