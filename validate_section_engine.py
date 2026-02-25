@@ -301,9 +301,12 @@ def print_section_summary(engine: CoachingEngine, fastest: RefLapFile) -> None:
         hist = engine._section_lap_times.get(cx.index)
         ref_str = f"{list(hist)[0]:.2f}s" if hist else "n/a"
         c_str = "T" + ",T".join(str(i) for i in cx.corner_indices)
+        # Post-hoc metrics from _compute_complex_metrics (ground-truth cross-check)
+        steer_col = (f"  steer_rms={cx.steering_rms:.1f}%  dir_changes={cx.n_direction_changes}"
+                     if getattr(cx, "steering_rms", 0) > 0 else "")
         print(
             f"  [{cx.index}] {cx.name:<38} {cx.complex_type:<14} "
-            f"{c_str:<18} ref={ref_str}"
+            f"{c_str:<18} ref={ref_str}{steer_col}"
         )
     print()
 

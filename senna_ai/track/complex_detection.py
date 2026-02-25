@@ -391,8 +391,11 @@ def detect_complexes(corners: list[Corner], ref_traces: list[LapTrace] = None) -
                     _sign_change_vals.append(_changes)
         _avg_steer_rms    = (sum(_steer_rms_vals)    / len(_steer_rms_vals))    if _steer_rms_vals    else 0.0
         _avg_sign_changes = (sum(_sign_change_vals) / len(_sign_change_vals)) if _sign_change_vals else 0.0
-        # Flow-zone behavioural signature: high steering workload + oscillating direction
-        _steer_flow = _avg_steer_rms > 10.0 and _avg_sign_changes >= 3.0 and avg_speed > 100
+        # Flow-zone behavioural signature: sustained high steering workload at speed.
+        # sign_changes deliberately excluded: a 2-corner complex (under-detected flow zone
+        # like Maggots-Becketts with only C3-C4 found) produces exactly 2 direction changes
+        # — below any integer threshold >= 3.  steer_rms alone is the stable signal.
+        _steer_flow = _avg_steer_rms > 10.0 and avg_speed > 100
 
         if avg_speed > 150 or _steer_flow:
             ctype = "esses"
